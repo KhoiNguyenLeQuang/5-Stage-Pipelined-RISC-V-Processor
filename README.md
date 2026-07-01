@@ -158,7 +158,7 @@ CPI sits well above the textbook "1.0" figure because these are short programs �
 │       ├── mem_wb_reg.sv          # MEM -> WB pipeline register
 │       ├── forwarding_unit.sv     # EX/MEM->EX and MEM/WB->EX forwarding
 │       ├── hazard_detection_unit.sv # load-use hazard -> 1-cycle stall
-│       └── datapath_pipelined.sv  # wires common/ + all of the above together
+│       └── datapath.sv  # wires common/ + all of the above together
 ├── tb/
 │   ├── single_cycle_tb.sv         # Phase 2: prints final register/memory state
 │   ├── pipeline_tb.sv             # Phase 3: per-cycle pipeline stage trace
@@ -170,7 +170,6 @@ CPI sits well above the textbook "1.0" figure because these are short programs �
 ├── test4_branch_not_taken.hex     # not-taken branch, no flush needed
 ├── test5_combined.hex             # same program as program.hex
 ├── build_phase5_tests.py          # generates the test-suite .hex files + expected values
-└── .gitignore
 ```
 
 ## Building and Running
@@ -205,7 +204,3 @@ Each testbench also writes a `.vcd` waveform file, viewable with `gtkwave <file>
 - **Branch targets are computed once, in ID** (PC + immediate), and the result is carried forward through the pipeline registers — not recomputed in EX — because only PC+4, not the raw PC, survives past the ID/EX boundary.
 - **`debug_pc` is threaded through every pipeline register** purely for testbench visibility (so a trace can print "this instruction is now in EX") — it's not part of the real datapath and a real CPU wouldn't include it.
 - **Stall and flush are structurally mutually exclusive** in this design (see [Hazard Handling](#hazard-handling)), which simplified the pipeline register logic — no priority arbitration between them was needed.
-
-## Why This Project
-
-Pipeline hazards, forwarding, and stalling come up constantly in verification and FPGA interviews. Having actually built one — and having watched forwarding fail without the stall, watched a flush cancel a specific wrong-path instruction, watched a stall and a flush interact on the same cycle — changes the conversation from reciting a textbook definition to walking through a real design decision.
