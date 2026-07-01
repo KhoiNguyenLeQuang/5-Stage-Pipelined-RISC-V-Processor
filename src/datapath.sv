@@ -1,30 +1,18 @@
 //==============================================================================
 // datapath_pipelined.sv
 //
-// The 5-stage pipeline skeleton: IF -> ID -> EX -> MEM -> WB, with a
-// pipeline register at every boundary. This is Phase 3 -- there is no
-// forwarding, no stalling, and no flush logic yet. That means:
+// Phase 4: the full 5-stage pipeline WITH hazard handling.
+//   - Forwarding unit: resolves data hazards where the producer is 1 or 2
+//     instructions ahead (EX/MEM->EX and MEM/WB->EX).
+//   - Hazard detection unit: catches the one case forwarding can't --
+//     load-use -- with a 1-cycle stall.
+//   - Branch flush: a taken branch (resolved in EX) flushes IF/ID and
+//     ID/EX, cancelling the 2 instructions fetched on the wrong path.
 //
-//   - A data-dependent instruction reading a register too soon WILL get
-//     a stale value (the producer hasn't reached WB yet).
-//   - A taken branch's 2 wrong-path instructions WILL still execute
-//     (nothing cancels them).
-//
-// Both are expected and correct for this phase -- Phase 4 fixes both.
-// The thing THIS phase needs to get right is structural: each instruction
-// should advance exactly one stage per clock cycle, with the right data
-// arriving at the right time.
-//
-// How to read this against the old single-cycle datapath.sv: every
-// module instantiated here (pc_register, instruction_memory,
-// control_unit, register_file, imm_generator, alu, data_memory) is
-// IDENTICAL to before -- same ports, same internal logic, same job. What
-// changed is everything AROUND them: instead of one shared pc_current /
-// instruction / alu_result / etc. that the whole datapath reads in the
-// same cycle, there are now five separate "generations" of those same
-// signals in flight simultaneously (if_..., id_..., ex_..., mem_...,
-// wb_...), one per pipeline stage, each one cycle older than the last.
-// The prefix on a signal name tells you which stage currently owns it.
+// With all three in place, this should now produce IDENTICAL final
+// register/memory values to the Phase 2 single-cycle datapath, on the
+// same test program -- that equivalence is the actual Phase 4 exit
+// criteria from the project plan.
 //==============================================================================
 
 module datapath_pipelined #(
@@ -36,24 +24,24 @@ module datapath_pipelined #(
   // ==========================================================================
   // IF stage
   // ==========================================================================
-  logic [31:0] if_pc;          // this cycle's fetch address (== pc_current from before)
+  logic [31:0] if_pc;
   logic [31:0] if_pc_plus4;
   logic [31:0] if_instruction;
 
-  // branch_taken/branch_target are fed back from EX's COMBINATIONAL output
-  // below (not from the EX/MEM register) - the redirect has to affect the
-  // very next fetch, not wait an extra cycle.
+  // Fed back from EX's combinational output below (not the EX/MEM register)
+  // -- the redirect has to affect the very next fetch, not wait a cycle.
   logic        ex_branch_taken;
   logic [31:0] ex_branch_target;
 
-  // Same pc_register module as the single-cycle design, unmodified - it
-  // doesn't know or care that it's now sitting inside a pipeline. Its
-  // branch_taken/branch_target inputs are wired to EX's combinational
-  // outputs further down this file (ex_branch_taken/ex_branch_target),
-  // NOT to anything coming out of a pipeline register - see the EX
-  // stage comment below for why that distinction matters.
+  // Driven by hazard_detection_unit below -- declared here since
+  // pc_register and if_id_reg (both instantiated in this section) need it.
+  // Order doesn't matter for continuous/structural connections in HDL --
+  // same pattern already used for ex_branch_taken/ex_branch_target above.
+  logic        stall;
+
   pc_register u_pc (
       .clk           (clk),
+      .stall         (stall),
       .branch_taken  (ex_branch_taken),
       .branch_target (ex_branch_target),
       .pc_current    (if_pc)
@@ -71,17 +59,12 @@ module datapath_pipelined #(
   // ==========================================================================
   // IF/ID
   // ==========================================================================
-  // This is where the pipelining actually happens - everything above is
-  // wires, computed fresh every cycle. From here down, what control_unit
-  // and friends see is one cycle STALE relative to if_pc/if_instruction:
-  // id_instruction is whatever IF fetched LAST cycle, while IF (above)
-  // has already moved on to fetching the NEXT instruction this same
-  // cycle. That overlap - two different instructions, two different
-  // stages, same clock edge - is the entire point of pipelining.
   logic [31:0] id_pc, id_pc_plus4, id_instruction;
 
   if_id_reg u_if_id (
       .clk             (clk),
+      .stall           (stall),
+      .flush           (ex_branch_taken),
       .pc_in           (if_pc),
       .pc_plus4_in     (if_pc_plus4),
       .instruction_in  (if_instruction),
@@ -93,10 +76,6 @@ module datapath_pipelined #(
   // ==========================================================================
   // ID stage
   // ==========================================================================
-  // Identical field slicing to the single-cycle datapath.sv's "Instruction
-  // Decode" section - the only difference is it now reads id_instruction
-  // (one cycle stale, from the IF/ID register) instead of reading
-  // instruction directly off instruction_memory's output.
   logic [6:0] id_opcode;
   logic [2:0] id_funct3;
   logic       id_funct7_5;
@@ -112,12 +91,6 @@ module datapath_pipelined #(
   logic [1:0] id_alu_op;
   logic       id_reg_write, id_mem_read, id_mem_write, id_mem_to_reg, id_branch, id_alu_src;
 
-  // Same control_unit module as before, unmodified. It still only looks
-  // at opcode/funct3/funct7_5 and produces the same 7 outputs - it has
-  // no idea it's now running once per cycle on a constant stream of
-  // instructions instead of once per "the" instruction. Note this only
-  // DECODES the instruction; it doesn't compute anything (no ALU result,
-  // no branch_taken) - those still happen later, in EX.
   control_unit u_control (
       .opcode     (id_opcode),
       .funct3     (id_funct3),
@@ -133,17 +106,8 @@ module datapath_pipelined #(
 
   logic [31:0] id_rs1_data, id_rs2_data;
 
-  // Register file's write port is driven by the WB stage, far below -
+  // Register file's write port is driven by the WB stage, far below --
   // one shared instance, read in ID, written in WB.
-  //
-  // The write-read bypass built into register_file.sv (see that file's
-  // header) is what makes this safe: WB (finishing instruction N) and ID
-  // (reading registers for instruction N+3, since 3 other instructions
-  // are mid-flight between them) can land on the exact same clock edge.
-  // Without the bypass, ID would read register_file's OLD stored value
-  // and only see instruction N's write one cycle too late. This is
-  // exactly the scenario the Phase 2 register_file.sv comment said
-  // pipelining would need - it's now actually being exercised here.
   logic [4:0]  wb_rd_addr;
   logic [31:0] wb_write_back_data;
   logic        wb_reg_write;
@@ -166,42 +130,49 @@ module datapath_pipelined #(
       .imm_out     (id_imm)
   );
 
-  // Branch target computed here, in ID - PC (the branch instruction's
+  // Branch target computed here, in ID -- PC (the branch instruction's
   // own address) + immediate. By the time we reach ID/EX, only PC+4 is
   // carried forward (per the plan), so this has to be computed now while
   // the real PC is still available, and the RESULT carried onward instead.
-  //
-  // This is the exact same pc_current + imm_out addition the single-cycle
-  // datapath did (there it was called branch_target, computed once,
-  // right before being used). Here it has to be computed one stage
-  // earlier than where it's actually consumed (EX), purely because id_pc
-  // - this instruction's own fetch address - only exists as a live
-  // signal during ID. One stage later (EX), all that's left of "this
-  // instruction's PC" is id_ex_reg's debug_pc field, which isn't wired
-  // into any real computation - so the addition has to happen now, and
-  // only the finished RESULT (id_branch_target) rides the pipeline
-  // register forward.
   logic [31:0] id_branch_target;
   assign id_branch_target = id_pc + id_imm;
+
+  // ---- Hazard detection: load-use hazard, checked against EX's occupant ----
+  // (ex_mem_read / ex_rd_addr are ID/EX's OUTPUTS -- the instruction
+  // currently occupying EX -- declared further below where id_ex_reg is
+  // instantiated. Same forward-reference pattern as stall/branch above.)
+  logic ex_mem_read;
+  logic [4:0] ex_rd_addr;
+
+  hazard_detection_unit u_hazard (
+      .ex_mem_read (ex_mem_read),
+      .ex_rd_addr  (ex_rd_addr),
+      .id_rs1_addr (id_rs1_addr),
+      .id_rs2_addr (id_rs2_addr),
+      .stall       (stall)
+  );
+
+  // ID/EX gets a bubble if EITHER a load-use stall OR a branch flush is in
+  // effect this cycle. These two can never both be true on the same cycle
+  // -- see hazard_detection_unit.sv's header -- so there's no priority
+  // question, just "insert a bubble if either fires."
+  logic id_ex_flush;
+  assign id_ex_flush = stall || ex_branch_taken;
 
   // ==========================================================================
   // ID/EX
   // ==========================================================================
-  // Every signal control_unit/imm_generator/register_file produced above
-  // gets latched here, all at once, so they all advance to EX together,
-  // still attached to the same instruction. This is the field-by-field
-  // mapping into id_ex_reg's ports - see id_ex_reg.sv for what each
-  // field is for and why it has to travel this way.
   logic [31:0] ex_debug_pc;
   logic [31:0] ex_pc_plus4;
   logic [31:0] ex_rs1_data, ex_rs2_data, ex_imm;
-  logic [4:0]  ex_rd_addr, ex_rs1_addr, ex_rs2_addr;
+  logic [4:0]  ex_rs1_addr, ex_rs2_addr;
   logic [31:0] ex_branch_target_staged;
   logic [1:0]  ex_alu_op;
-  logic        ex_alu_src, ex_mem_read, ex_mem_write, ex_reg_write, ex_mem_to_reg, ex_branch;
+  logic        ex_alu_src, ex_mem_write, ex_reg_write, ex_mem_to_reg, ex_branch;
 
   id_ex_reg u_id_ex (
       .clk               (clk),
+      .flush             (id_ex_flush),
       .debug_pc_in       (id_pc),
       .pc_plus4_in       (id_pc_plus4),
       .rs1_data_in       (id_rs1_data),
@@ -240,71 +211,73 @@ module datapath_pipelined #(
   // ==========================================================================
   // EX stage
   // ==========================================================================
-  // Same ALU-source mux and alu module as the single-cycle design -
-  // ex_alu_src picks between the immediate and rs2's value exactly the
-  // way alu_src did before, just now reading the ID/EX-staged copies of
-  // those signals instead of the live ones.
+
+  // ---- Forwarding: does EX need a value still sitting in EX/MEM or MEM/WB? ----
+  // (mem_rd_addr/mem_reg_write and wb_rd_addr/wb_reg_write are declared
+  // further below, where EX/MEM and MEM/WB actually live -- forward
+  // reference, same as elsewhere in this file.)
+  logic [4:0] mem_rd_addr;
+  logic       mem_reg_write;
+
+  logic [1:0] forward_a, forward_b;
+
+  forwarding_unit u_forward (
+      .ex_rs1_addr   (ex_rs1_addr),
+      .ex_rs2_addr   (ex_rs2_addr),
+      .mem_rd_addr   (mem_rd_addr),
+      .mem_reg_write (mem_reg_write),
+      .wb_rd_addr    (wb_rd_addr),
+      .wb_reg_write  (wb_reg_write),
+      .forward_a     (forward_a),
+      .forward_b     (forward_b)
+  );
+
+  logic [31:0] mem_alu_result;   // EX/MEM's forwarding source (declared below, forward-referenced)
+
+  logic [31:0] ex_operand_a;
+  logic [31:0] forwarded_rs2;    // used by BOTH the ALU (via ALUSrc mux) and SW's stored value
+
+  always_comb begin
+    unique case (forward_a)
+      2'b10:   ex_operand_a = mem_alu_result;      // EX/MEM
+      2'b01:   ex_operand_a = wb_write_back_data;  // MEM/WB
+      default: ex_operand_a = ex_rs1_data;         // no forwarding
+    endcase
+
+    unique case (forward_b)
+      2'b10:   forwarded_rs2 = mem_alu_result;
+      2'b01:   forwarded_rs2 = wb_write_back_data;
+      default: forwarded_rs2 = ex_rs2_data;
+    endcase
+  end
+
   logic [31:0] ex_operand_b;
   logic [31:0] ex_alu_result;
   logic        ex_alu_zero;
 
-  assign ex_operand_b = ex_alu_src ? ex_imm : ex_rs2_data;
+  assign ex_operand_b = ex_alu_src ? ex_imm : forwarded_rs2;
 
   alu u_alu (
-      .operand_a (ex_rs1_data),
+      .operand_a (ex_operand_a),
       .operand_b (ex_operand_b),
       .alu_op    (ex_alu_op),
       .result    (ex_alu_result),
       .zero      (ex_alu_zero)
   );
 
-  // The branch decision resolves here, combinationally, this cycle - and
-  // feeds straight back up to the PC mux at the top of this file, so it
-  // affects the very next fetch. (No flush logic yet, so the 2
-  // instructions already fetched on the wrong path will still run - see
-  // the file header.)
-  //
-  // This is exactly the branch/branch_taken/branch_target relationship
-  // from the single-cycle design, unchanged in substance, just split
-  // across stages now:
-  //   - ex_branch        ("is this instruction a BEQ at all") was decided
-  //     back in ID by control_unit, then just rode the ID/EX register
-  //     here as branch_in/branch_out - pure opcode decode, no math.
-  //   - ex_alu_zero       ("did rs1 - rs2 come out to 0") is brand new
-  //     this cycle - the ALU directly above just computed it.
-  //   - ex_branch_taken   is the AND of those two - "should we actually
-  //     jump" -- and it cannot exist any earlier than THIS line, because
-  //     it needs alu_zero, and alu_zero doesn't exist until the ALU above
-  //     has run.
-  //   - ex_branch_target  is NOT computed here - it's id_branch_target
-  //     (pc_current + imm_out), computed back in ID, simply staged
-  //     through the ID/EX register and renamed on the way out
-  //     (branch_target_out -> ex_branch_target_staged). EX doesn't add
-  //     anything to it; it just forwards the already-finished address
-  //     alongside branch_taken so both arrive at the PC mux together.
-  //
-  // Critically, ex_branch_taken/ex_branch_target feed pc_register at the
-  // TOP of this file as plain combinational wires, not through a pipeline
-  // register - if they had to wait for the EX/MEM register like
-  // everything else this stage produces, the corrected fetch wouldn't
-  // happen until one cycle later than necessary, which would mean 3
-  // wrong-path instructions in flight instead of 2.
+  // The branch decision resolves here, combinationally, this cycle -- and
+  // feeds straight back up to the PC mux and the flush inputs above, so
+  // it affects the very next fetch and cancels the 2 wrong-path
+  // instructions already in the pipeline.
   assign ex_branch_taken  = ex_branch && ex_alu_zero;
   assign ex_branch_target = ex_branch_target_staged;
 
   // ==========================================================================
   // EX/MEM
   // ==========================================================================
-  // branch_taken_in/branch_target_in here are recording a decision that's
-  // already old news by the time it lands - the actual PC redirect
-  // already happened, one cycle earlier, straight out of the EX stage
-  // above. These staged copies exist for Phase 4 (flush logic needs to
-  // know, while looking at MEM, "was the instruction that's now in EX/MEM
-  // a taken branch").
   logic [31:0] mem_debug_pc;
-  logic [31:0] mem_alu_result, mem_rs2_data;
-  logic [4:0]  mem_rd_addr;
-  logic        mem_mem_read, mem_mem_write, mem_reg_write, mem_mem_to_reg;
+  logic [31:0] mem_rs2_data;
+  logic        mem_mem_read, mem_mem_write, mem_mem_to_reg;
   logic        mem_branch_taken;
   logic [31:0] mem_branch_target;
 
@@ -312,7 +285,7 @@ module datapath_pipelined #(
       .clk               (clk),
       .debug_pc_in       (ex_debug_pc),
       .alu_result_in     (ex_alu_result),
-      .rs2_data_in       (ex_rs2_data),
+      .rs2_data_in       (forwarded_rs2),   // <-- forwarded value, not raw ex_rs2_data (fixes SW hazard)
       .rd_addr_in        (ex_rd_addr),
       .mem_read_in       (ex_mem_read),
       .mem_write_in      (ex_mem_write),
@@ -336,14 +309,6 @@ module datapath_pipelined #(
   // ==========================================================================
   // MEM stage
   // ==========================================================================
-  // Same data_memory module as the single-cycle design, unmodified -
-  // still a combinational read / synchronous write, exactly as discussed
-  // for the single-cycle version. mem_alu_result here plays the same role
-  // alu_result did before: for LW/SW it's an address (rs1 + imm); for
-  // everything else it's just a result passing through untouched (LW/SW
-  // are the only opcodes where mem_mem_read/mem_mem_write are ever 1, so
-  // a non-memory instruction's mem_alu_result gets fed in as an address
-  // here but is simply never acted on).
   logic [31:0] mem_read_data;
 
   data_memory u_dmem (
@@ -358,8 +323,6 @@ module datapath_pipelined #(
   // ==========================================================================
   // MEM/WB
   // ==========================================================================
-  // The last pipeline boundary - one more clock edge between "memory
-  // read finished" and "write-back actually happens."
   logic [31:0] wb_debug_pc;
   logic [31:0] wb_alu_result, wb_mem_read_data;
   logic        wb_mem_to_reg;
@@ -382,15 +345,10 @@ module datapath_pipelined #(
   );
 
   // ==========================================================================
-  // WB stage - result feeds back up to the register file's write port
+  // WB stage -- result feeds back up to the register file's write port,
+  // AND up to the forwarding unit's MEM/WB source (both uses of the exact
+  // same value).
   // ==========================================================================
-  // The exact same write-back mux from the single-cycle datapath.sv,
-  // unchanged in logic - mem_to_reg still just picks "loaded value" vs
-  // "ALU result." The only thing that's different is timing: wb_rd_addr
-  // and wb_reg_write (declared up in the ID stage section, since that's
-  // where register_file needed them as inputs) are driven from all the
-  // way down here, four pipeline registers and four clock edges after
-  // that same instruction was originally fetched in IF.
   assign wb_write_back_data = wb_mem_to_reg ? wb_mem_read_data : wb_alu_result;
 
 endmodule

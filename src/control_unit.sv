@@ -9,7 +9,7 @@
 module control_unit (
     input  logic [6:0] opcode,      // instruction[6:0] (what type of operations is this ?)
     input  logic [2:0] funct3,      // instruction[14:12] (Mathematical/AND/OR)
-    input  logic       funct7_5,    // instruction[30] - distinguishes ADD (0) from SUB (1)
+    input  logic       funct7_5,    // instruction[30] -- distinguishes ADD (0) from SUB (1)
 
     output logic [1:0] alu_op,      // ALU operation option. Tells which operation to perform
     output logic       reg_write,   // 1 = write the result of the ALU to the register file, 0 = don't write
@@ -71,14 +71,14 @@ module control_unit (
         alu_src   = 1'b1;           // address = rs1 + immediate
         alu_op    = ALU_ADD;
         mem_write = 1'b1;
-        // reg_write stays 0 - SW never writes a register
+        // reg_write stays 0 -- SW never writes a register
       end
 
       OPC_BRANCH: begin             // BEQ
         alu_src = 1'b0;             // compare two register values directly
         alu_op  = ALU_SUB;          // subtract; ALU's zero flag means "equal"
         branch  = 1'b1;
-        // reg_write stays 0 - BEQ never writes a register
+        // reg_write stays 0 -- BEQ never writes a register
       end
 
       default: ; 

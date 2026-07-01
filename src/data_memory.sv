@@ -1,11 +1,10 @@
 //==============================================================================
 // data_memory.sv
 //
-// Load Work (LW) and Store Work (SW) storage.
 // Storage for LW/SW. This project's instruction subset only ever loads or
-// stores a full 32-bit word at a time (no LB/LH/byte-level access),
-// the address coming in is a byte address, but storage internally is 
-// indexed one slot per word.
+// stores a full 32-bit word at a time (no LB/LH/byte-level access), so --
+// just like instruction_memory.sv -- the address coming in is a byte
+// address, but storage internally is indexed one slot per word.
 //==============================================================================
 
 module data_memory #(
@@ -29,9 +28,8 @@ module data_memory #(
   end
 
   // Reads are combinational. If mem_read isn't asserted this cycle, the
-  // value just isn't used by anything downstream - no harm driving it unconditionally.
-  assign read_data = mem[addr[31:2]]; // address counts in byte (separate every 4 bit)
-                                      // so word index is addr[31:2] to point to the right word
+  // value just isn't used by anything downstream -- no harm driving it unconditionally.
+  assign read_data = mem[addr[31:2]]; // byte address, so word index is addr[31:2]
 
   always_ff @(posedge clk) begin
     if (mem_write) begin
